@@ -52,15 +52,6 @@ output directory and prints the saved path.
 | `--proxy` | *(`HTTPS_PROXY` env)* | Proxy URL for the OAuth / AWS calls. |
 | `--timeout` | `600` | Seconds to wait for the browser sign-in. |
 
-### Install the credential
-
-Copy the generated file into your CLIProxyAPI auths directory:
-
-```bash
-cp CLIProxyAPI_<username>.json ~/.cli-cache-proxy/auths/
-```
-
-CLIProxyAPI scans that directory for `*.json` credentials and hot-reloads them.
 
 ---
 
@@ -106,21 +97,6 @@ credential (alphabetical keys, a `disabled` flag, a millisecond `timestamp`):
 
 The social (Google / GitHub) path produces `"auth_method": "social"` and omits
 the IdP-specific fields (`client_id`, `issuer_url`, `token_endpoint`, `scopes`).
-
----
-
-## Security notes
-
-- The IdP issuer arrives in an attacker-influenceable portal callback, so it is
-  constrained to an **allow-list** of Microsoft Entra hosts
-  (`*.microsoftonline.com`, `.us`, `.cn`). The issuer and **both** discovered
-  endpoints (authorize + token) are validated: `https` only, no IP literals,
-  no redirect-following on discovery. This is the primary control against SSRF /
-  open-redirect / forced-authorization abuse.
-- The loopback listener accepts **GET only**, matches the anti-CSRF `state` on
-  every leg, and the enterprise leg is **single-shot** (a second descriptor
-  cannot reset an in-flight login).
-- The credential file holds a refresh token and is written with mode `0600`.
 
 ---
 
