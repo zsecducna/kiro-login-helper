@@ -1,0 +1,13 @@
+# Generated Kiro credentials — contain live refresh tokens. NEVER commit.
+CLIProxyAPI_*.json
+kiro-*.json
+*.auth.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS
+.DS_Store
