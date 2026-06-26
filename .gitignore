@@ -11,3 +11,7 @@ venv/
 
 # OS
 .DS_Store
+
+# Local working dirs — cloned repos / agent state, never commit
+tmp/
+.omc/
