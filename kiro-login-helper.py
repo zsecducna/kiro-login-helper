@@ -66,7 +66,7 @@ OAUTH_CALLBACK_PATH = "/oauth/callback"
 # Cognito-backed social token-exchange endpoint (Google/GitHub path).
 SOCIAL_AUTH_BASE = "https://prod.us-east-1.auth.desktop.kiro.dev"
 SOCIAL_TOKEN_URL = SOCIAL_AUTH_BASE + "/oauth/token"
-# Default AWS region for the CodeWhisperer endpoints when none is supplied.
+# Default AWS region for the Amazon Q (CodeWhisperer) endpoints when none is supplied.
 DEFAULT_REGION = "us-east-1"
 # Kiro IDE version embedded in the User-Agent (CodeWhisperer rejects non-Kiro UAs).
 KIRO_IDE_VERSION = "0.10.32"
@@ -313,11 +313,18 @@ def build_x_amz_user_agent(machine_id):
 # list_available_profiles resolves the runtime-mandatory profile ARN for a
 # credential. For external IdP tokens it MUST send TokenType: EXTERNAL_IDP or
 # CodeWhisperer silently returns an empty profile list.
+def codewhisperer_host(region):
+    # Amazon Q runtime host for every region. "q.<region>.amazonaws.com" is the
+    # current (rebranded) endpoint; the legacy "codewhisperer.<region>" host is
+    # retired and not used for any region.
+    return "q.%s.amazonaws.com" % region
+
+
 def list_available_profiles(access_token, region, external_idp, proxy_url):
     if not access_token.strip():
         raise ValueError("access token is empty")
     machine_id = build_machine_id(access_token)
-    url = "https://codewhisperer.%s.amazonaws.com/" % region
+    url = "https://%s/" % codewhisperer_host(region)
     headers = {
         "Content-Type": "application/x-amz-json-1.0",
         "Accept": "application/x-amz-json-1.0",
