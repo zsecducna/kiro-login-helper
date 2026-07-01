@@ -2,7 +2,7 @@
 
 Interactive, step-by-step helper that walks you through the **Kiro (AWS
 CodeWhisperer) browser SSO sign-in** and writes a
-[CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)-compatible Kiro auth
+[CLIProxyAPI](https://github.com/zsecducna/cli-cache-proxy-api)-compatible Kiro auth
 JSON file.
 
 It targets the **enterprise / external IdP** path used by **Microsoft 365 /
