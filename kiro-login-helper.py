@@ -633,6 +633,75 @@ def build_auth_json(token, region):
 
 # --- Interactive driver -------------------------------------------------------
 
+# Telegram contact surfaced on the banner so users always know where to reach
+# the author / bot for support, updates, and new credential drops.
+TELEGRAM_HANDLE = "@codezdev_bot"
+TELEGRAM_URL = "https://t.me/codezdev_bot"
+
+
+def print_banner(subtitle=""):
+    """Print a framed ASCII banner with the tool name and Telegram bot link.
+
+    Colour is emitted only when writing to a real terminal (and NO_COLOR is
+    unset) so piped/redirected output stays clean. Every glyph used -- box
+    drawing plus the ANSI-Shadow block letters -- is single terminal column
+    wide, so plain len()-based padding keeps the right border aligned.
+    """
+    use_color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+    def c(code, text):
+        # Wrap text in an SGR colour code, or pass it through untouched when
+        # colour is disabled. Length math elsewhere uses the *plain* text so
+        # these escape sequences never disturb the border alignment.
+        return "\033[%sm%s\033[0m" % (code, text) if use_color else text
+
+    # ANSI-Shadow block letters, one list per glyph. Each list's rows share a
+    # fixed width (K/R=8, I=3, O=9) so zip+join yields evenly aligned rows.
+    K = ["██╗  ██╗", "██║ ██╔╝", "█████╔╝ ", "██╔═██╗ ", "██║  ██╗", "╚═╝  ╚═╝"]
+    I = ["██╗", "██║", "██║", "██║", "██║", "╚═╝"]
+    R = ["██████╗ ", "██╔══██╗", "██████╔╝", "██╔══██╗", "██║  ██║", "╚═╝  ╚═╝"]
+    O = [" ██████╗ ", "██╔═══██╗", "██║   ██║", "██║   ██║", "╚██████╔╝", " ╚═════╝ "]
+    logo = ["".join(parts) for parts in zip(K, I, R, O)]
+
+    width = 76  # inner width; +2 border chars == the 78-col rule used below
+
+    def row(plain, colored=None, indent=None):
+        # Render one bordered line. `plain` drives the padding math; `colored`
+        # (defaulting to `plain`) is what actually prints. `indent` is the left
+        # gap -- when omitted the content is centred.
+        colored = plain if colored is None else colored
+        if len(plain) > width:
+            plain, colored = plain[:width], plain[:width]
+        if indent is None:
+            indent = (width - len(plain)) // 2
+        right = max(0, width - len(plain) - indent)
+        bar = c("38;5;44", "│")
+        return bar + " " * indent + colored + " " * right + bar
+
+    top = c("38;5;44", "┌" + "─" * width + "┐")
+    bottom = c("38;5;44", "└" + "─" * width + "┘")
+
+    print(top)
+    print(row(""))
+    for line in logo:
+        print(row(line, c("1;38;5;44", line)))
+    print(row(""))
+    print(row("K I R O   L O G I N   H E L P E R",
+              c("1;38;5;231", "K I R O   L O G I N   H E L P E R")))
+    if subtitle:
+        print(row(subtitle, c("38;5;245", subtitle)))
+    print(row(""))
+    tg_label, tg_val = "Telegram   ", TELEGRAM_HANDLE
+    print(row(tg_label + tg_val,
+              c("38;5;245", tg_label) + c("1;38;5;45", tg_val), indent=6))
+    link_label, link_val = "Chat / bot ", TELEGRAM_URL
+    print(row(link_label + link_val,
+              c("38;5;245", link_label) + c("4;38;5;51", link_val), indent=6))
+    print(row(""))
+    print(bottom)
+    print()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Interactive Kiro M365/SSO login helper -> writes CLIProxyAPI_<username>.json",
@@ -677,11 +746,7 @@ def main():
         return 1
 
     # Step 3: print the step-by-step instructions.
-    bar = "=" * 78
-    print(bar)
-    print("  Kiro Microsoft 365 (Entra ID / Azure AD) SSO login helper")
-    print(bar)
-    print()
+    print_banner("Microsoft 365 · Entra ID (Azure AD) · SSO login helper")
     print("STEP 1. Open the URL below in a *GUEST / INCOGNITO* browser window.")
     print("        (Incognito avoids a cached personal session hijacking the M365 login.)")
     print()

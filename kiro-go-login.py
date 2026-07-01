@@ -310,12 +310,9 @@ def main():
         print("ERROR: %s" % exc, file=sys.stderr)
         return 1
 
-    # Step 3: print the step-by-step instructions.
-    bar = "=" * 78
-    print(bar)
-    print("  Kiro -> Kiro-Go login helper (social + Microsoft 365 / Entra ID SSO)")
-    print(bar)
-    print()
+    # Step 3: print the step-by-step instructions. Reuse the helper's banner so
+    # the Telegram bot link and styling stay identical across both entrypoints.
+    helper.print_banner("Kiro-Go account · social + M365 / Entra ID SSO")
     print("STEP 1. Open the URL below in a *GUEST / INCOGNITO* browser window.")
     print("        (Incognito avoids a cached personal session hijacking the login.)")
     print()
