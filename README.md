@@ -47,7 +47,7 @@ output directory and prints the saved path.
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--username` | *(from token)* | Override the account label used in the filename. By default it is derived from the access-token JWT (`preferred_username` → the M365 email). |
-| `--region` | `us-east-1` | AWS region for the CodeWhisperer endpoints. Overridden by the region in the resolved profile ARN when present. |
+| `--region` | *(prompted)* | AWS region for the CodeWhisperer endpoints: `us-east-1` or `eu-central-1`. Omit to be asked interactively; pass it to skip the prompt. Overridden by the region in the resolved profile ARN when present. |
 | `--out-dir` | *(current dir)* | Directory to write the credential file into. |
 | `--proxy` | *(`HTTPS_PROXY` env)* | Proxy URL for the OAuth / AWS calls. |
 | `--timeout` | `600` | Seconds to wait for the browser sign-in. |

@@ -256,7 +256,12 @@ def main():
         description="Interactive Kiro SSO login helper -> writes a Kiro-Go account JSON",
     )
     parser.add_argument("--email", default="", help="Override the email recorded on the account")
-    parser.add_argument("--region", default=DEFAULT_REGION, help="AWS auth region (default: %(default)s)")
+    parser.add_argument(
+        "--region",
+        default=None,
+        choices=("us-east-1", "eu-central-1"),
+        help="AWS auth region; omit to be prompted interactively",
+    )
     parser.add_argument("--provider", default="", help="Override the provider label (e.g. GitHub, Google, AzureAD)")
     parser.add_argument(
         "--out-dir",
@@ -286,6 +291,7 @@ def main():
     helper = load_helper()
     proxy_url = args.proxy.strip() or None
     timeout = args.timeout if args.timeout is not None else helper.SOCIAL_LOGIN_TIMEOUT_SECONDS
+    region = args.region or helper.prompt_region(DEFAULT_REGION)
 
     # Step 1: generate PKCE + state and build the hosted sign-in URL (reusing the
     # helper's constants so this stays byte-for-byte the same portal flow).
@@ -346,7 +352,6 @@ def main():
 
     # Step 5: exchange the captured authorization code for tokens.
     print("Authorization received. Exchanging code for tokens ...", flush=True)
-    region = args.region.strip() or DEFAULT_REGION
     token = {"auth_method": result["kind"]}
     try:
         if result["kind"] == "external_idp":

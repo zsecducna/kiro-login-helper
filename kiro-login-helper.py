@@ -68,6 +68,9 @@ SOCIAL_AUTH_BASE = "https://prod.us-east-1.auth.desktop.kiro.dev"
 SOCIAL_TOKEN_URL = SOCIAL_AUTH_BASE + "/oauth/token"
 # Default AWS region for the Amazon Q (CodeWhisperer) endpoints when none is supplied.
 DEFAULT_REGION = "us-east-1"
+# Regions offered by the interactive --region prompt (both are known-good
+# CodeWhisperer control-plane hosts for this login flow).
+REGION_CHOICES = ("us-east-1", "eu-central-1")
 # Kiro IDE version embedded in the User-Agent (CodeWhisperer rejects non-Kiro UAs).
 KIRO_IDE_VERSION = "0.10.32"
 # X-Amz-Target for the ListAvailableProfiles call used to resolve the profile ARN.
@@ -702,12 +705,37 @@ def print_banner(subtitle=""):
     print()
 
 
+# prompt_region asks the operator to pick the AWS region for the
+# CodeWhisperer control-plane calls. Always run interactively (unless
+# overridden by --region) so a wrong region is never silently assumed.
+def prompt_region(default_region):
+    print("Select AWS region:")
+    for i, opt in enumerate(REGION_CHOICES, 1):
+        marker = " (default)" if opt == default_region else ""
+        print("  %d) %s%s" % (i, opt, marker))
+    default_index = REGION_CHOICES.index(default_region) + 1 if default_region in REGION_CHOICES else 1
+    while True:
+        choice = input("Region [%d]: " % default_index).strip()
+        if not choice:
+            return default_region
+        if choice.isdigit() and 1 <= int(choice) <= len(REGION_CHOICES):
+            return REGION_CHOICES[int(choice) - 1]
+        if choice in REGION_CHOICES:
+            return choice
+        print("Invalid choice. Enter 1 or 2.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Interactive Kiro M365/SSO login helper -> writes CLIProxyAPI_<username>.json",
     )
     parser.add_argument("--username", default="", help="Override the account label used in the filename")
-    parser.add_argument("--region", default=DEFAULT_REGION, help="AWS region (default: %(default)s)")
+    parser.add_argument(
+        "--region",
+        default=None,
+        choices=REGION_CHOICES,
+        help="AWS region; omit to be prompted interactively",
+    )
     parser.add_argument(
         "--out-dir",
         default=os.getcwd(),
@@ -722,6 +750,7 @@ def main():
     )
     args = parser.parse_args()
     proxy_url = args.proxy.strip() or None
+    region = args.region or prompt_region(DEFAULT_REGION)
 
     # Step 1: generate PKCE + state and build the hosted sign-in URL.
     verifier = random_url_safe(96)
@@ -781,7 +810,6 @@ def main():
 
     # Step 5: exchange the captured authorization code for tokens.
     print("Authorization received. Exchanging code for tokens ...", flush=True)
-    region = args.region.strip() or DEFAULT_REGION
     token = {"auth_method": result["kind"]}
     try:
         if result["kind"] == "external_idp":
