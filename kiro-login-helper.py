@@ -862,13 +862,17 @@ def main():
         fh.write("\n")
 
     print()
-    print(bar)
+    # Horizontal rule framing the success summary; 78 columns to match the
+    # banner frame. The colour helper c() is local to print_banner(), so use
+    # a plain uncoloured line here.
+    rule = "─" * 78
+    print(rule)
     print("  Kiro authentication successful!")
     print("  Account : %s" % username)
     print("  Method  : %s" % token["auth_method"])
     print("  Profile : %s" % token["profile_arn"])
     print("  Saved   : %s" % out_path)
-    print(bar)
+    print(rule)
     print()
     print("Next: copy this file into your CLIProxyAPI auths directory, e.g.")
     print("  cp '%s' ~/.cli-cache-proxy/auths/" % out_path)
