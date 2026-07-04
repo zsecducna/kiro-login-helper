@@ -16,9 +16,12 @@ This is a faithful Python re-implementation of the Go login flow in
 
 ## Requirements
 
-- **Python ≥ 3.7** (standard library only — no third-party packages, no `pip install`).
+- **Python ≥ 3.7** (standard library only for the core OAuth flow — no
+  third-party packages required).
 - A web browser, ideally able to open a **guest / incognito** window.
 - TCP port **3128** on loopback must be free (the OAuth redirect target).
+- Optional: [`cloakbrowser`](https://github.com/CloakHQ/CloakBrowser)
+  (`pip install cloakbrowser`) to auto-open the sign-in URL — see below.
 
 ---
 
@@ -30,9 +33,14 @@ python3 kiro-login-helper.py
 
 Then follow the two on-screen steps:
 
-1. **Open the printed URL in a guest / incognito browser window.**
-   Incognito avoids a cached personal session hijacking the corporate M365
-   login.
+1. **Sign-in URL.** When `cloakbrowser` is installed (`pip install
+   cloakbrowser`), the script opens the sign-in URL for you automatically in a
+   brand-new browser profile — a real profile (not incognito, so M365 doesn't
+   flag it as an empty/ephemeral context), created empty and wiped completely
+   once the login flow finishes (success, failure, or timeout). Without
+   `cloakbrowser` installed, it falls back to printing the URL for you to open
+   yourself in a guest / incognito window (incognito avoids a cached personal
+   session hijacking the corporate M365 login):
    - Chrome / Edge: `Ctrl/Cmd+Shift+N`
    - Firefox: `Ctrl/Cmd+Shift+P`
 2. **Sign in with your Microsoft 365 work/school account.**

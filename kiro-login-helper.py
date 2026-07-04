@@ -28,8 +28,11 @@
 #      (sending the mandatory TokenType: EXTERNAL_IDP header).
 #   8. We write the final JSON as CLIProxyAPI_<username>.json.
 #
-# Only the Python standard library is used so the script runs anywhere a recent
-# python3 is installed -- no pip install required.
+# Only the Python standard library is used for the core OAuth flow so the script
+# runs anywhere a recent python3 is installed -- no pip install required. The one
+# optional exception is CloakBrowser (auto-opens the sign-in URL in a fresh,
+# disposable browser profile); when it is not installed the script falls back to
+# printing the URL for the user to open manually.
 
 import argparse
 import base64
@@ -40,9 +43,11 @@ import json
 import os
 import queue
 import secrets
+import shutil
 import socket
 import socketserver
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -597,6 +602,45 @@ def start_listener(portal_state, proxy_url):
     return servers, flow_state
 
 
+# --- CloakBrowser launch (fresh, disposable profile) ---------------------------
+
+# open_in_cloakbrowser opens `url` in a CloakBrowser window backed by a brand-new
+# temporary profile directory: a real profile (not incognito, so the M365 portal
+# never sees an empty/ephemeral-context signal) that starts with zero data because
+# the directory was just created. Returns a cleanup() callable that closes the
+# browser and deletes the profile directory -- the caller must invoke it once the
+# login flow finishes (success, failure, or timeout) so no browsing data survives.
+# Returns None when the optional `cloakbrowser` package is not installed, or the
+# launch fails for any reason, so the caller can fall back to a manual URL.
+def open_in_cloakbrowser(url):
+    try:
+        from cloakbrowser import launch_persistent_context
+    except ImportError:
+        return None
+    profile_dir = tempfile.mkdtemp(prefix="kiro-login-cloakbrowser-")
+    ctx = None
+    try:
+        ctx = launch_persistent_context(profile_dir, headless=False)
+        ctx.new_page().goto(url)
+    except Exception:  # noqa: BLE001 - any launch/navigation failure falls back to a manual open
+        if ctx is not None:  # launch succeeded but goto() failed -- don't orphan the process
+            try:
+                ctx.close()
+            except Exception:  # noqa: BLE001 - best-effort browser shutdown
+                pass
+        shutil.rmtree(profile_dir, ignore_errors=True)
+        return None
+
+    def cleanup():
+        try:
+            ctx.close()
+        except Exception:  # noqa: BLE001 - best-effort browser shutdown
+            pass
+        shutil.rmtree(profile_dir, ignore_errors=True)
+
+    return cleanup
+
+
 # --- Final auth JSON assembly -------------------------------------------------
 
 # build_auth_json assembles the CLIProxyAPI-compatible Kiro credential dict. It
@@ -774,23 +818,32 @@ def main():
         print("ERROR: %s" % exc, file=sys.stderr)
         return 1
 
-    # Step 3: print the step-by-step instructions.
+    # Step 3: open the sign-in URL. Prefer a fresh CloakBrowser window (a real,
+    # just-created profile -- so the portal doesn't flag it as incognito -- wiped
+    # once the login flow finishes); fall back to a manual URL otherwise.
     print_banner("Microsoft 365 · Entra ID (Azure AD) · SSO login helper")
-    print("STEP 1. Open the URL below in a *GUEST / INCOGNITO* browser window.")
-    print("        (Incognito avoids a cached personal session hijacking the M365 login.)")
-    print()
-    print("        Chrome/Edge:  Ctrl/Cmd+Shift+N      Firefox:  Ctrl/Cmd+Shift+P")
-    print()
-    print("  " + signin_url)
-    print()
-    print("STEP 2. Sign in with your Microsoft 365 work/school account.")
-    print("        You will be redirected automatically; when the page says")
-    print('        "sign-in complete", return here.')
-    print()
-    print("Waiting for SSO authorization (timeout: %ds) ... " % args.timeout, flush=True)
-
-    # Step 4: wait for the listener to capture the final result.
+    # cloak_cleanup is acquired before the try so the finally below reliably closes
+    # the browser and wipes its profile even if a print() or Step 4's wait raises.
+    cloak_cleanup = open_in_cloakbrowser(signin_url)
     try:
+        if cloak_cleanup:
+            print("STEP 1. A fresh browser window has been opened for you.")
+            print("        (New profile, no prior data; it is wiped once sign-in finishes.)")
+        else:
+            print("STEP 1. Open the URL below in a *GUEST / INCOGNITO* browser window.")
+            print("        (Incognito avoids a cached personal session hijacking the M365 login.)")
+            print()
+            print("        Chrome/Edge:  Ctrl/Cmd+Shift+N      Firefox:  Ctrl/Cmd+Shift+P")
+            print()
+            print("  " + signin_url)
+        print()
+        print("STEP 2. Sign in with your Microsoft 365 work/school account.")
+        print("        You will be redirected automatically; when the page says")
+        print('        "sign-in complete", return here.')
+        print()
+        print("Waiting for SSO authorization (timeout: %ds) ... " % args.timeout, flush=True)
+
+        # Step 4: wait for the listener to capture the final result.
         result = flow_state.result_queue.get(timeout=args.timeout)
     except queue.Empty:
         for srv in servers:
@@ -803,6 +856,8 @@ def main():
                 srv.shutdown()
             except Exception:  # noqa: BLE001 - best-effort cleanup
                 pass
+        if cloak_cleanup:
+            cloak_cleanup()
 
     if isinstance(result, Exception):
         print("ERROR: %s" % result, file=sys.stderr)

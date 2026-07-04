@@ -26,10 +26,10 @@
 #   actually drives the q.<region>.amazonaws.com endpoint. The default region here
 #   (eu-central-1) is only the fallback used when the ARN carries no region.
 #
-# All OAuth/state-machine logic is reused from kiro-login-helper.py via importlib
-# so there is a single source of truth for the (security-sensitive) login flow;
-# this file only changes the default region and the final output assembly. Only
-# the Python standard library is used.
+# All OAuth/state-machine logic (including the optional CloakBrowser auto-open)
+# is reused from kiro-login-helper.py via importlib so there is a single source
+# of truth for the (security-sensitive) login flow; this file only changes the
+# default region and the final output assembly.
 
 import argparse
 import copy
@@ -316,23 +316,31 @@ def main():
         print("ERROR: %s" % exc, file=sys.stderr)
         return 1
 
-    # Step 3: print the step-by-step instructions. Reuse the helper's banner so
-    # the Telegram bot link and styling stay identical across both entrypoints.
+    # Step 3: open the sign-in URL. Reuse the helper's banner and CloakBrowser
+    # launcher so styling and the disposable-profile behavior stay identical
+    # across both entrypoints.
     helper.print_banner("Kiro-Go account · social + M365 / Entra ID SSO")
-    print("STEP 1. Open the URL below in a *GUEST / INCOGNITO* browser window.")
-    print("        (Incognito avoids a cached personal session hijacking the login.)")
-    print()
-    print("        Chrome/Edge:  Ctrl/Cmd+Shift+N      Firefox:  Ctrl/Cmd+Shift+P")
-    print()
-    print("  " + signin_url)
-    print()
-    print("STEP 2. Sign in (Google/GitHub, or your Microsoft 365 work/school account).")
-    print('        When the page says "sign-in complete", return here.')
-    print()
-    print("Waiting for SSO authorization (timeout: %ds) ... " % timeout, flush=True)
-
-    # Step 4: wait for the listener to capture the final result.
+    # cloak_cleanup is acquired before the try so the finally below reliably closes
+    # the browser and wipes its profile even if a print() or Step 4's wait raises.
+    cloak_cleanup = helper.open_in_cloakbrowser(signin_url)
     try:
+        if cloak_cleanup:
+            print("STEP 1. A fresh browser window has been opened for you.")
+            print("        (New profile, no prior data; it is wiped once sign-in finishes.)")
+        else:
+            print("STEP 1. Open the URL below in a *GUEST / INCOGNITO* browser window.")
+            print("        (Incognito avoids a cached personal session hijacking the login.)")
+            print()
+            print("        Chrome/Edge:  Ctrl/Cmd+Shift+N      Firefox:  Ctrl/Cmd+Shift+P")
+            print()
+            print("  " + signin_url)
+        print()
+        print("STEP 2. Sign in (Google/GitHub, or your Microsoft 365 work/school account).")
+        print('        When the page says "sign-in complete", return here.')
+        print()
+        print("Waiting for SSO authorization (timeout: %ds) ... " % timeout, flush=True)
+
+        # Step 4: wait for the listener to capture the final result.
         result = flow_state.result_queue.get(timeout=timeout)
     except queue.Empty:
         for srv in servers:
@@ -345,6 +353,8 @@ def main():
                 srv.shutdown()
             except Exception:  # noqa: BLE001 - best-effort cleanup
                 pass
+        if cloak_cleanup:
+            cloak_cleanup()
 
     if isinstance(result, Exception):
         print("ERROR: %s" % result, file=sys.stderr)
