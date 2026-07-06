@@ -20,7 +20,7 @@ This is a faithful Python re-implementation of the Go login flow in
   third-party packages required).
 - A web browser, ideally able to open a **guest / incognito** window.
 - TCP port **3128** on loopback must be free (the OAuth redirect target).
-- Optional: [`cloakbrowser`](https://github.com/CloakHQ/CloakBrowser)
+- HIGHLY RECOMMENDED: [`cloakbrowser`](https://github.com/CloakHQ/CloakBrowser)
   (`pip install cloakbrowser`) to auto-open the sign-in URL — see below.
 
 ---
