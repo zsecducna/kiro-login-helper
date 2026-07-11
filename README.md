@@ -9,8 +9,13 @@ It targets the **enterprise / external IdP** path used by **Microsoft 365 /
 Entra ID (Azure AD)** tenants, and also transparently handles the **social**
 (Google / GitHub) path — both legs arrive on the same loopback listener.
 
+It additionally supports **AWS IAM Identity Center (IdC)** login via a tenant
+**start URL**, using the AWS SSO OIDC device-authorization flow (register client
+→ device authorization → approve in browser → poll for token). Trigger it with
+`--idc-start-url` (or pick it from the interactive method menu).
+
 This is a faithful Python re-implementation of the Go login flow in
-`internal/auth/kiro/social.go` + `sdk/auth/kiro.go`.
+`internal/auth/kiro/social.go`, `kiro.go` (device flow) + `sdk/auth/kiro.go`.
 
 ---
 
@@ -31,7 +36,18 @@ This is a faithful Python re-implementation of the Go login flow in
 python3 kiro-login-helper.py
 ```
 
-Then follow the two on-screen steps:
+Run with no method flag and you are asked to choose between the **hosted SSO
+portal** (default) and **AWS IAM Identity Center**. To go straight to IdC:
+
+```bash
+python3 kiro-login-helper.py --idc-start-url https://d-1234567890.awsapps.com/start
+```
+
+For the IdC method a browser window opens the AWS device-approval page; sign in
+with your Identity Center account, confirm the shown user code, and approve. The
+account label defaults to the start-URL directory id (override with `--username`).
+
+For the hosted-portal method, follow the two on-screen steps:
 
 1. **Sign-in URL.** When `cloakbrowser` is installed (`pip install
    cloakbrowser`), the script opens the sign-in URL for you automatically in a
@@ -54,8 +70,9 @@ output directory and prints the saved path.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--username` | *(from token)* | Override the account label used in the filename. By default it is derived from the access-token JWT (`preferred_username` → the M365 email). |
-| `--region` | *(prompted)* | AWS region for the CodeWhisperer endpoints: `us-east-1` or `eu-central-1`. Omit to be asked interactively; pass it to skip the prompt. Overridden by the region in the resolved profile ARN when present. |
+| `--username` | *(from token)* | Override the account label used in the filename. By default it is derived from the access-token JWT (`preferred_username` → the M365 email), or the start-URL directory id for the IdC method. |
+| `--idc-start-url` | *(prompted)* | AWS IAM Identity Center start URL (e.g. `https://d-1234567890.awsapps.com/start`). When set, runs the IdC device-authorization login instead of the hosted portal. |
+| `--region` | *(prompted)* | AWS region for the CodeWhisperer / OIDC endpoints: `us-east-1` or `eu-central-1`. Omit to be asked interactively; pass it to skip the prompt. Overridden by the region in the resolved profile ARN when present. |
 | `--out-dir` | *(current dir)* | Directory to write the credential file into. |
 | `--proxy` | *(`HTTPS_PROXY` env)* | Proxy URL for the OAuth / AWS calls. |
 | `--timeout` | `600` | Seconds to wait for the browser sign-in. |
@@ -78,6 +95,42 @@ output directory and prints the saved path.
 7. Resolve the CodeWhisperer profile ARN via ListAvailableProfiles
    (mandatory header: TokenType: EXTERNAL_IDP).
 8. Write CLIProxyAPI_<username>.json.
+```
+
+### AWS IAM Identity Center (IdC) — `--idc-start-url`
+
+```
+1. RegisterClient at https://oidc.<region>.amazonaws.com/client/register
+   → clientId + clientSecret (public client, device_code + refresh_token grants).
+2. StartDeviceAuthorization with the tenant startUrl → deviceCode + userCode +
+   verificationUriComplete.
+3. Open verificationUriComplete in a browser; user approves + confirms userCode.
+4. Poll https://oidc.<region>.amazonaws.com/token (grant device_code) until the
+   user approves → access / refresh / expires_in.
+5. Resolve the profile ARN via ListAvailableProfiles (no TokenType header — an
+   IdC token is a normal AWS SSO token).
+6. Write CLIProxyAPI_<username>.json with auth_method "idc".
+```
+
+The IdC credential persists `client_id`, `client_secret`, `region`, `start_url`
+and `username` so it refreshes against the AWS SSO OIDC token endpoint:
+
+```json
+{
+  "access_token": "...",
+  "auth_method": "idc",
+  "client_id": "...",
+  "client_secret": "...",
+  "disabled": false,
+  "expired": "2026-07-11T05:54:50Z",
+  "profile_arn": "arn:aws:codewhisperer:us-east-1:...:profile/...",
+  "refresh_token": "...",
+  "region": "us-east-1",
+  "start_url": "https://d-1234567890.awsapps.com/start",
+  "timestamp": 1783745690438,
+  "type": "kiro",
+  "username": "d-1234567890"
+}
 ```
 
 ### Output format
@@ -116,5 +169,7 @@ the IdP-specific fields (`client_id`, `issuer_url`, `token_endpoint`, `scopes`).
 | `external IdP host ... is not allow-listed` | Your tenant uses a non-Entra IdP. Add its host suffix to `ALLOWED_EXTERNAL_IDP_SUFFIXES` in the script. |
 | `failed to resolve profile ARN` | The M365 account is not provisioned for Kiro / CodeWhisperer, or the token lacks the right scopes. |
 | `SSO login timed out` | Sign-in not completed within `--timeout`. Re-run; raise `--timeout` if needed. |
+| `device code expired before authorization completed` | IdC device approval not finished within `--timeout` / the device-code lifetime. Re-run and approve promptly. |
+| IdC: `failed to resolve profile ARN` | The Identity Center account is not provisioned for Kiro/CodeWhisperer, or `--region` is not the region hosting your Identity Center instance. |
 | Browser shows the personal account picker | You did not use an incognito/guest window — a cached session interfered. Retry in incognito. |
 ```

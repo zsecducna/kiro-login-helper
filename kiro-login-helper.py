@@ -42,6 +42,7 @@ import io
 import json
 import os
 import queue
+import re
 import secrets
 import shutil
 import socket
@@ -93,6 +94,34 @@ ALLOWED_EXTERNAL_IDP_SUFFIXES = (
     ".microsoftonline.us",
     ".microsoftonline.cn",
 )
+
+# --- AWS SSO OIDC device-authorization login (Builder ID / IAM Identity Center) ---
+#
+# The IdC leg is a wholly separate flow from the hosted portal above: instead of the
+# loopback-listener PKCE dance, it registers a public OIDC client, starts an RFC 8628
+# device authorization for the tenant's start URL, has the user approve it in a browser,
+# then polls the token endpoint until approval. Mirrors internal/auth/kiro/kiro.go +
+# constants.go so the emitted credential refreshes identically to a native IDC login.
+
+# clientName registered with AWS SSO OIDC (mirrors OAuthClientName).
+OIDC_CLIENT_NAME = "kiro-oauth-client"
+# issuerUrl sent at client registration (the Kiro IAM Identity Center instance). This is
+# fixed by the reference Go client; the *user's* tenant is selected by the device-auth
+# start URL, not by this value.
+OIDC_ISSUER_URL = "https://identitycenter.amazonaws.com/ssoins-722374e8c3c8e6c6"
+# AWS Builder ID portal start URL, used as the default when no IDC start URL is supplied.
+BUILDER_ID_START_URL = "https://view.awsapps.com/start"
+# CodeWhisperer scopes requested during client registration (mirrors OAuthScopes).
+OIDC_SCOPES = (
+    "codewhisperer:completions",
+    "codewhisperer:analysis",
+    "codewhisperer:conversations",
+)
+# RFC 8628 device-code grant type and the OAuth2 refresh grant type.
+DEVICE_CODE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code"
+REFRESH_GRANT_TYPE = "refresh_token"
+# Minimum seconds between device-token polls (AWS default; a slow_down response raises it).
+OIDC_MIN_POLL_INTERVAL = 5
 
 
 # --- PKCE helpers -------------------------------------------------------------
@@ -296,6 +325,171 @@ def exchange_social_code(code, verifier, proxy_url):
         int(parsed.get("expiresIn", 0) or 0),
         parsed.get("profileArn", "") or "",
     )
+
+
+# --- AWS SSO OIDC device-authorization flow (IAM Identity Center leg) ----------
+
+# The three OIDC endpoints are region-scoped: the client/register, device_authorization,
+# and token calls must all target oidc.<region>.amazonaws.com for the region that hosts
+# the Identity Center instance the start URL belongs to.
+def oidc_register_url(region):
+    return "https://oidc.%s.amazonaws.com/client/register" % region
+
+
+def oidc_device_auth_url(region):
+    return "https://oidc.%s.amazonaws.com/device_authorization" % region
+
+
+def oidc_token_url(region):
+    return "https://oidc.%s.amazonaws.com/token" % region
+
+
+# register_oidc_client registers a public OAuth client and returns (client_id,
+# client_secret). Both are persisted so the credential can be refreshed later against
+# the AWS SSO OIDC token endpoint (refresh_token grant needs the client credentials).
+def register_oidc_client(region, proxy_url):
+    payload = {
+        "clientName": OIDC_CLIENT_NAME,
+        "clientType": "public",
+        "scopes": list(OIDC_SCOPES),
+        "grantTypes": [DEVICE_CODE_GRANT_TYPE, REFRESH_GRANT_TYPE],
+        "issuerUrl": OIDC_ISSUER_URL,
+    }
+    status, parsed, text = http_post_json(oidc_register_url(region), payload, None, proxy_url)
+    parsed = parsed or {}
+    client_id = parsed.get("clientId", "") or ""
+    client_secret = parsed.get("clientSecret", "") or ""
+    if not (200 <= status < 300) or not client_id or not client_secret:
+        raise RuntimeError("OIDC client registration failed (status %d): %s" % (status, text))
+    return client_id, client_secret
+
+
+# start_device_authorization requests a device+user code pair for the start URL. It
+# returns the raw response dict (deviceCode, userCode, verificationUri,
+# verificationUriComplete, expiresIn, interval).
+def start_device_authorization(client_id, client_secret, start_url, region, proxy_url):
+    payload = {
+        "clientId": client_id,
+        "clientSecret": client_secret,
+        "startUrl": (start_url or "").strip() or BUILDER_ID_START_URL,
+    }
+    status, parsed, text = http_post_json(oidc_device_auth_url(region), payload, None, proxy_url)
+    parsed = parsed or {}
+    if not (200 <= status < 300) or not parsed.get("deviceCode"):
+        raise RuntimeError("device authorization failed (status %d): %s" % (status, text))
+    return parsed
+
+
+# poll_for_idc_token polls the token endpoint until the user approves, the device code
+# expires, or the overall timeout elapses. Returns (access, refresh, expires_in). It
+# honors the server-provided interval (respecting slow_down back-off) and never polls
+# faster than OIDC_MIN_POLL_INTERVAL.
+def poll_for_idc_token(client_id, client_secret, device_code, region, interval, expires_in, timeout, proxy_url):
+    interval = max(int(interval or 0), OIDC_MIN_POLL_INTERVAL)
+    # The device code has its own lifetime; never wait past it or the caller's timeout.
+    window = timeout if not expires_in else min(timeout, expires_in)
+    deadline = time.time() + window
+    while True:
+        time.sleep(interval)
+        if time.time() > deadline:
+            raise RuntimeError("device code expired before authorization completed")
+        payload = {
+            "clientId": client_id,
+            "clientSecret": client_secret,
+            "deviceCode": device_code,
+            "grantType": DEVICE_CODE_GRANT_TYPE,
+        }
+        try:
+            status, parsed, text = http_post_json(oidc_token_url(region), payload, None, proxy_url)
+        except (urllib.error.URLError, OSError):
+            # A transient network hiccup during one poll of a multi-minute wait must not
+            # abort the whole login: keep polling until the deadline instead.
+            continue
+        parsed = parsed or {}
+        err = (parsed.get("error", "") or "").strip()
+        # authorization_pending: user hasn't approved yet. slow_down: also back off.
+        if err in ("authorization_pending", "slow_down"):
+            if err == "slow_down":
+                interval += 5
+            continue
+        if not (200 <= status < 300):
+            # A bare 400 with no error code is treated as still-pending (mirrors the Go
+            # client); anything else is a hard failure surfaced to the user.
+            if not err and status == 400:
+                continue
+            raise RuntimeError("token poll failed (status %d): %s" % (status, text))
+        access = parsed.get("accessToken", "") or ""
+        if not access:
+            raise RuntimeError("empty access token in token response")
+        return access, parsed.get("refreshToken", "") or "", int(parsed.get("expiresIn", 0) or 0)
+
+
+# directory_id_from_start_url extracts the IAM Identity Center directory identifier from a
+# start URL. AWS issues start URLs of the form https://<directory-id>.awsapps.com/start
+# (or a friendly alias); the leading host label is that identifier. Returns "" when absent.
+def directory_id_from_start_url(start_url):
+    s = (start_url or "").strip()
+    if not s:
+        return ""
+    if "://" not in s:
+        s = "https://" + s
+    host = (urllib.parse.urlparse(s).hostname or "").strip()
+    if not host:
+        return ""
+    return host.split(".")[0]
+
+
+# idc_login runs the full device-authorization flow: register client, start device auth,
+# open the verification URL (CloakBrowser when available, else printed), then poll for the
+# token. Returns a dict with client_id, client_secret, access_token, refresh_token,
+# expires_in. The verification URL is opened in a fresh disposable profile that is wiped
+# once the flow finishes.
+def idc_login(start_url, region, proxy_url, timeout):
+    print("Registering OIDC client with AWS SSO OIDC (%s) ..." % region, flush=True)
+    client_id, client_secret = register_oidc_client(region, proxy_url)
+    print("Requesting device authorization ...", flush=True)
+    dev = start_device_authorization(client_id, client_secret, start_url, region, proxy_url)
+    verify_url = (dev.get("verificationUriComplete") or dev.get("verificationUri") or "").strip()
+    user_code = (dev.get("userCode", "") or "").strip()
+
+    cloak_cleanup = open_in_cloakbrowser(verify_url) if verify_url else None
+    try:
+        print()
+        if cloak_cleanup:
+            print("STEP 1. A fresh browser window has been opened to approve the sign-in.")
+            print("        (New profile, no prior data; it is wiped once sign-in finishes.)")
+        else:
+            print("STEP 1. Open this URL in a browser and approve the sign-in:")
+            print()
+            print("  " + verify_url)
+        if user_code:
+            print()
+            print("        Confirm the code shown in the browser matches: %s" % user_code)
+        print()
+        print("STEP 2. Sign in with your IAM Identity Center account and approve access.")
+        print()
+        print("Waiting for device authorization (timeout: %ds) ... " % timeout, flush=True)
+        access, refresh, expires_in = poll_for_idc_token(
+            client_id,
+            client_secret,
+            dev.get("deviceCode", ""),
+            region,
+            int(dev.get("interval", 0) or 0),
+            int(dev.get("expiresIn", 0) or 0),
+            timeout,
+            proxy_url,
+        )
+    finally:
+        if cloak_cleanup:
+            cloak_cleanup()
+
+    return {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "access_token": access,
+        "refresh_token": refresh,
+        "expires_in": expires_in,
+    }
 
 
 # --- Profile ARN resolution (ListAvailableProfiles) ---------------------------
@@ -675,6 +869,15 @@ def build_auth_json(token, region):
         obj["issuer_url"] = token["issuer_url"]
     if token.get("scopes"):
         obj["scopes"] = token["scopes"]
+    # AWS SSO OIDC (IAM Identity Center) refresh material. The refresh_token grant needs
+    # the client_secret alongside client_id; start_url/username record the tenant and the
+    # operator-supplied account label (the IDC access token is opaque and carries no name).
+    if token.get("client_secret"):
+        obj["client_secret"] = token["client_secret"]
+    if token.get("start_url"):
+        obj["start_url"] = token["start_url"]
+    if token.get("username"):
+        obj["username"] = token["username"]
     return obj
 
 
@@ -769,11 +972,166 @@ def prompt_region(default_region):
         print("Invalid choice. Enter 1 or 2.")
 
 
+# AWS region syntax (e.g. us-east-1, eu-central-1, ap-southeast-2). The region is
+# interpolated into the OIDC endpoint hostname, so it is format-validated before use to
+# stop a paste-typo from rerouting the client secret and tokens to an unintended host.
+_AWS_REGION_RE = re.compile(r"^[a-z]{2}-[a-z]+-\d+$")
+
+
+def valid_aws_region(region):
+    return bool(_AWS_REGION_RE.match((region or "").strip()))
+
+
+# prompt_idc_region asks for the AWS region hosting the IAM Identity Center instance.
+# Unlike the portal flow, IDC instances can live in any region, so any syntactically valid
+# region string is accepted (not just the two CodeWhisperer control-plane choices).
+def prompt_idc_region(default_region):
+    if not sys.stdin.isatty():
+        return default_region
+    while True:
+        choice = input("AWS region for IAM Identity Center [%s]: " % default_region).strip()
+        if not choice:
+            return default_region
+        if valid_aws_region(choice):
+            return choice
+        print("Invalid AWS region (expected e.g. us-east-1). Try again.")
+
+
+# prompt_login_method lets the operator choose between the hosted SSO portal (the default
+# social / external-IdP flow) and the AWS IAM Identity Center device flow. Returns
+# (method, start_url) where method is "portal" or "idc". Non-interactive stdin defaults to
+# the portal so existing scripted use is unchanged.
+def prompt_login_method():
+    if not sys.stdin.isatty():
+        return "portal", ""
+    print("Select Kiro login method:")
+    print("  1) Hosted SSO portal — Microsoft 365 / Google / GitHub (default)")
+    print("  2) AWS IAM Identity Center (start URL)")
+    choice = input("Method [1]: ").strip().lower()
+    if choice in ("2", "idc"):
+        start_url = input("IDC Start URL (e.g. https://d-1234567890.awsapps.com/start): ").strip()
+        return "idc", start_url
+    return "portal", ""
+
+
+# write_credential serializes the token bundle to CLIProxyAPI_<label>.json (mode 0600)
+# in out_dir and returns the written path. Shared by every login method.
+def write_credential(token, region, label, out_dir):
+    safe = sanitize_file_component(label) or ("kiro-%d" % int(time.time() * 1000))
+    obj = build_auth_json(token, region)
+    out_dir = os.path.abspath(out_dir)
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "CLIProxyAPI_%s.json" % safe)
+    # 0600: the file holds the refresh token (and OIDC client secret for IDC); owner-only.
+    fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(obj, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    return out_path
+
+
+# print_success prints the framed post-login summary shared by every login method.
+def print_success(username, token, out_path):
+    rule = "─" * 78
+    print()
+    print(rule)
+    print("  Kiro authentication successful!")
+    print("  Account : %s" % username)
+    print("  Method  : %s" % token["auth_method"])
+    print("  Profile : %s" % token["profile_arn"])
+    print("  Saved   : %s" % out_path)
+    print(rule)
+    print()
+    print("Next: copy this file into your CLIProxyAPI auths directory, e.g.")
+    print("  cp '%s' ~/.cli-cache-proxy/auths/" % out_path)
+
+
+# resolve_idc_profile_arn resolves the profile ARN for an IDC token, trying the login
+# region first and then us-east-1 (a profile may be homed in a different region than the
+# Identity Center instance). The IDC token is a normal AWS SSO token, so no EXTERNAL_IDP
+# header is sent (external_idp=False).
+def resolve_idc_profile_arn(access_token, region, proxy_url):
+    last_exc = None
+    tried = []
+    for candidate in (region, DEFAULT_REGION):
+        if not candidate or candidate in tried:
+            continue
+        tried.append(candidate)
+        try:
+            return list_available_profiles(access_token, candidate, False, proxy_url)
+        except Exception as exc:  # noqa: BLE001 - try the fallback region before giving up
+            last_exc = exc
+    raise last_exc
+
+
+# run_idc_login drives the AWS IAM Identity Center device-authorization login end to end
+# and writes the CLIProxyAPI credential file. Returns a process exit code.
+def run_idc_login(args, start_url, proxy_url):
+    start_url = (start_url or "").strip()
+    if not start_url:
+        print("ERROR: an IAM Identity Center start URL is required for IdC login.", file=sys.stderr)
+        return 1
+    region = args.region or prompt_idc_region(DEFAULT_REGION)
+    if not valid_aws_region(region):
+        print("ERROR: invalid AWS region %r (expected e.g. us-east-1)." % region, file=sys.stderr)
+        return 1
+    # The IDC access token is opaque (no JWT identity), so the account label must come from
+    # the operator or, failing that, the directory id in the start URL.
+    label = args.username.strip() or directory_id_from_start_url(start_url)
+    if not label:
+        label = "kiro-%d" % int(time.time() * 1000)
+
+    print_banner("AWS IAM Identity Center · device-authorization login")
+    try:
+        creds = idc_login(start_url, region, proxy_url, args.timeout)
+    except Exception as exc:  # noqa: BLE001 - surface any registration/device/poll failure
+        print("ERROR: %s" % exc, file=sys.stderr)
+        return 1
+
+    token = {
+        "auth_method": "idc",
+        "access_token": creds["access_token"],
+        "refresh_token": creds["refresh_token"],
+        "expires_in": creds["expires_in"],
+        "profile_arn": "",
+        "client_id": creds["client_id"],
+        "client_secret": creds["client_secret"],
+        "start_url": start_url,
+        "username": label,
+    }
+
+    print("Resolving CodeWhisperer profile ARN ...", flush=True)
+    try:
+        token["profile_arn"] = resolve_idc_profile_arn(token["access_token"], region, proxy_url)
+    except Exception as exc:  # noqa: BLE001 - profile is mandatory; report clearly
+        print("ERROR: failed to resolve profile ARN: %s" % exc, file=sys.stderr)
+        print(
+            "       (The IAM Identity Center account must be provisioned for Kiro/CodeWhisperer.)",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Prefer the region embedded in the ARN so the saved credential and runtime agree.
+    arn_region = region_from_profile_arn(token["profile_arn"])
+    if arn_region:
+        region = arn_region
+
+    out_path = write_credential(token, region, label, args.out_dir)
+    print_success(label, token, out_path)
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Interactive Kiro M365/SSO login helper -> writes CLIProxyAPI_<username>.json",
     )
     parser.add_argument("--username", default="", help="Override the account label used in the filename")
+    parser.add_argument(
+        "--idc-start-url",
+        default="",
+        help="AWS IAM Identity Center start URL (e.g. https://d-1234567890.awsapps.com/start). "
+        "When set, runs the IdC device-authorization login instead of the hosted SSO portal.",
+    )
     parser.add_argument(
         "--region",
         default=None,
@@ -794,6 +1152,18 @@ def main():
     )
     args = parser.parse_args()
     proxy_url = args.proxy.strip() or None
+
+    # Method selection: an explicit --idc-start-url forces the IAM Identity Center device
+    # flow; otherwise ask interactively (defaulting to the hosted SSO portal). The portal
+    # remains the default so existing non-interactive use is unchanged.
+    idc_start_url = args.idc_start_url.strip()
+    if idc_start_url:
+        method = "idc"
+    else:
+        method, idc_start_url = prompt_login_method()
+    if method == "idc":
+        return run_idc_login(args, idc_start_url, proxy_url)
+
     region = args.region or prompt_region(DEFAULT_REGION)
 
     # Step 1: generate PKCE + state and build the hosted sign-in URL.
@@ -930,35 +1300,9 @@ def main():
     if not username:
         # Last resort so a file is always produced.
         username = "kiro-%d" % int(time.time() * 1000)
-    safe = sanitize_file_component(username)
-    if not safe:
-        safe = "kiro-%d" % int(time.time() * 1000)
 
-    obj = build_auth_json(token, region)
-    out_dir = os.path.abspath(args.out_dir)
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, "CLIProxyAPI_%s.json" % safe)
-    # 0600: the file holds the refresh token; restrict it to the owner.
-    fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump(obj, fh, indent=2, sort_keys=True)
-        fh.write("\n")
-
-    print()
-    # Horizontal rule framing the success summary; 78 columns to match the
-    # banner frame. The colour helper c() is local to print_banner(), so use
-    # a plain uncoloured line here.
-    rule = "─" * 78
-    print(rule)
-    print("  Kiro authentication successful!")
-    print("  Account : %s" % username)
-    print("  Method  : %s" % token["auth_method"])
-    print("  Profile : %s" % token["profile_arn"])
-    print("  Saved   : %s" % out_path)
-    print(rule)
-    print()
-    print("Next: copy this file into your CLIProxyAPI auths directory, e.g.")
-    print("  cp '%s' ~/.cli-cache-proxy/auths/" % out_path)
+    out_path = write_credential(token, region, username, args.out_dir)
+    print_success(username, token, out_path)
     return 0
 
 

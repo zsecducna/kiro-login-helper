@@ -119,9 +119,10 @@ def build_kiro_go_account(token, region, email, provider_override):
     if email:
         account["email"] = email
     # Provider label: explicit override wins, else the per-method default Kiro-Go uses.
-    account["provider"] = provider_override or (
-        "AzureAD" if auth_method == "external_idp" else "Kiro SSO"
-    )
+    account["provider"] = provider_override or {
+        "external_idp": "AzureAD",
+        "idc": "IAM Identity Center",
+    }.get(auth_method, "Kiro SSO")
     if token.get("profile_arn"):
         account["profileArn"] = token["profile_arn"]
     # External-IdP (enterprise SSO) refresh material. Kiro-Go refreshes these
@@ -136,6 +137,16 @@ def build_kiro_go_account(token, region, email, provider_override):
             account["issuerUrl"] = token["issuer_url"]
         if token.get("scopes"):
             account["scopes"] = token["scopes"]
+    # AWS SSO OIDC (IAM Identity Center) refresh material. Kiro-Go refreshes these against
+    # the oidc.<region>.amazonaws.com token endpoint (refresh_token grant), which needs the
+    # registered clientId + clientSecret; startUrl records the tenant.
+    if auth_method == "idc":
+        if token.get("client_id"):
+            account["clientId"] = token["client_id"]
+        if token.get("client_secret"):
+            account["clientSecret"] = token["client_secret"]
+        if token.get("start_url"):
+            account["startUrl"] = token["start_url"]
     return account
 
 
@@ -249,6 +260,116 @@ def merge_into_config(config_path, account):
     return action, config_path
 
 
+# --- Persistence + reporting (shared by every login method) -------------------
+
+# persist_and_report writes the assembled Kiro-Go account (merging into --config and/or a
+# standalone file per the flags) and prints the framed success summary. Returns a process
+# exit code. Shared by the hosted-portal and IAM Identity Center paths.
+def persist_and_report(args, helper, account, email, region, profile_arn):
+    written = []  # (label, path) pairs to report at the end
+    if args.config.strip():
+        try:
+            action, cfg_path = merge_into_config(args.config.strip(), account)
+        except SystemExit:
+            raise
+        except Exception as exc:  # noqa: BLE001 - surface any merge failure
+            print("ERROR: failed to update %s: %s" % (args.config, exc), file=sys.stderr)
+            return 1
+        written.append(("config.json (%s)" % action, cfg_path))
+
+    # Write the standalone single-account file unless a --config merge already
+    # ran without --keep-standalone.
+    if not args.config.strip() or args.keep_standalone:
+        label = email or account["id"]
+        safe = helper.sanitize_file_component(label) or ("kiro-%d" % int(time.time() * 1000))
+        out_dir = os.path.abspath(args.out_dir)
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, "kiro-go-account_%s.json" % safe)
+        # 0600: the file holds the refresh token; restrict it to the owner.
+        fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(account, fh, indent=2)
+            fh.write("\n")
+        written.append(("standalone account", out_path))
+
+    rule = "─" * 78
+    print()
+    print(rule)
+    print("  Kiro-Go credential created!")
+    print("  Account : %s" % (email or "(no email claim)"))
+    print("  Method  : %s" % account["authMethod"])
+    print("  Provider: %s" % account["provider"])
+    print("  Region  : %s" % region)
+    print("  Profile : %s" % profile_arn)
+    for label, path in written:
+        print("  Saved   : %s  [%s]" % (path, label))
+    print(rule)
+    print()
+    if args.config.strip():
+        print("Next: (re)start Kiro-Go pointed at this config, e.g.")
+        print("  CONFIG_PATH='%s' ./kiro-go" % os.path.abspath(args.config.strip()))
+    else:
+        print("Next: add this account to your Kiro-Go data/config.json. Either")
+        print("  - paste the object into the config.json \"accounts\": [ ... ] array, or")
+        print("  - re-run with --config /path/to/Kiro-Go/data/config.json to merge it automatically.")
+    if account["authMethod"] == "external_idp":
+        print()
+        print("Note: external_idp (Microsoft 365 / Entra ID) refresh needs Kiro-Go PR #131")
+        print("      (tokenEndpoint/issuerUrl/scopes + the external_idp refresh branch).")
+    return 0
+
+
+# run_idc_kiro_go drives the AWS IAM Identity Center device-authorization login (reusing the
+# helper's OIDC flow) and persists the result as a Kiro-Go account. Returns an exit code.
+def run_idc_kiro_go(args, helper, start_url, proxy_url, timeout):
+    start_url = (start_url or "").strip()
+    if not start_url:
+        print("ERROR: an IAM Identity Center start URL is required for IdC login.", file=sys.stderr)
+        return 1
+    region = args.region or helper.prompt_idc_region(DEFAULT_REGION)
+    if not helper.valid_aws_region(region):
+        print("ERROR: invalid AWS region %r (expected e.g. us-east-1)." % region, file=sys.stderr)
+        return 1
+
+    helper.print_banner("Kiro-Go account · AWS IAM Identity Center SSO")
+    try:
+        creds = helper.idc_login(start_url, region, proxy_url, timeout)
+    except Exception as exc:  # noqa: BLE001 - surface any registration/device/poll failure
+        print("ERROR: %s" % exc, file=sys.stderr)
+        return 1
+
+    token = {
+        "auth_method": "idc",
+        "access_token": creds["access_token"],
+        "refresh_token": creds["refresh_token"],
+        "expires_in": creds["expires_in"],
+        "profile_arn": "",
+        "client_id": creds["client_id"],
+        "client_secret": creds["client_secret"],
+        "start_url": start_url,
+    }
+
+    print("Resolving CodeWhisperer profile ARN ...", flush=True)
+    try:
+        # IDC tokens are normal AWS SSO tokens: resolve with external_idp=False (no header).
+        token["profile_arn"] = resolve_profile_arn(
+            helper, token["access_token"], region, False, proxy_url
+        )
+    except Exception as exc:  # noqa: BLE001 - profile is mandatory; report clearly
+        print("ERROR: failed to resolve profile ARN: %s" % exc, file=sys.stderr)
+        return 1
+
+    arn_region = helper.region_from_profile_arn(token["profile_arn"])
+    if arn_region:
+        region = arn_region
+
+    # The IDC access token is opaque (no email claim), so label the account by the
+    # start-URL directory id unless the operator supplied --email.
+    email = args.email.strip() or helper.directory_id_from_start_url(start_url)
+    account = build_kiro_go_account(token, region, email, args.provider.strip())
+    return persist_and_report(args, helper, account, email, region, token["profile_arn"])
+
+
 # --- Interactive driver -------------------------------------------------------
 
 def main():
@@ -263,6 +384,12 @@ def main():
         help="AWS auth region; omit to be prompted interactively",
     )
     parser.add_argument("--provider", default="", help="Override the provider label (e.g. GitHub, Google, AzureAD)")
+    parser.add_argument(
+        "--idc-start-url",
+        default="",
+        help="AWS IAM Identity Center start URL (e.g. https://d-1234567890.awsapps.com/start). "
+        "When set, runs the IdC device-authorization login instead of the hosted SSO portal.",
+    )
     parser.add_argument(
         "--out-dir",
         default=os.getcwd(),
@@ -291,6 +418,18 @@ def main():
     helper = load_helper()
     proxy_url = args.proxy.strip() or None
     timeout = args.timeout if args.timeout is not None else helper.SOCIAL_LOGIN_TIMEOUT_SECONDS
+
+    # Method selection: an explicit --idc-start-url forces the IAM Identity Center device
+    # flow; otherwise ask interactively (defaulting to the hosted SSO portal) so existing
+    # non-interactive use is unchanged.
+    idc_start_url = args.idc_start_url.strip()
+    if idc_start_url:
+        method = "idc"
+    else:
+        method, idc_start_url = helper.prompt_login_method()
+    if method == "idc":
+        return run_idc_kiro_go(args, helper, idc_start_url, proxy_url, timeout)
+
     region = args.region or helper.prompt_region(DEFAULT_REGION)
 
     # Step 1: generate PKCE + state and build the hosted sign-in URL (reusing the
@@ -426,59 +565,8 @@ def main():
 
     # Step 7: assemble the Kiro-Go account and persist it.
     email = args.email.strip() or extract_email(helper, token["access_token"])
-    provider_override = args.provider.strip()
-    account = build_kiro_go_account(token, region, email, provider_override)
-
-    written = []  # (label, path) pairs to report at the end
-    if args.config.strip():
-        try:
-            action, cfg_path = merge_into_config(args.config.strip(), account)
-        except SystemExit:
-            raise
-        except Exception as exc:  # noqa: BLE001 - surface any merge failure
-            print("ERROR: failed to update %s: %s" % (args.config, exc), file=sys.stderr)
-            return 1
-        written.append(("config.json (%s)" % action, cfg_path))
-
-    # Write the standalone single-account file unless a --config merge already
-    # ran without --keep-standalone.
-    if not args.config.strip() or args.keep_standalone:
-        label = email or account["id"]
-        safe = helper.sanitize_file_component(label) or ("kiro-%d" % int(time.time() * 1000))
-        out_dir = os.path.abspath(args.out_dir)
-        os.makedirs(out_dir, exist_ok=True)
-        out_path = os.path.join(out_dir, "kiro-go-account_%s.json" % safe)
-        # 0600: the file holds the refresh token; restrict it to the owner.
-        fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(account, fh, indent=2)
-            fh.write("\n")
-        written.append(("standalone account", out_path))
-
-    print()
-    print(bar)
-    print("  Kiro-Go credential created!")
-    print("  Account : %s" % (email or "(no email claim)"))
-    print("  Method  : %s" % account["authMethod"])
-    print("  Provider: %s" % account["provider"])
-    print("  Region  : %s" % region)
-    print("  Profile : %s" % token["profile_arn"])
-    for label, path in written:
-        print("  Saved   : %s  [%s]" % (path, label))
-    print(bar)
-    print()
-    if args.config.strip():
-        print("Next: (re)start Kiro-Go pointed at this config, e.g.")
-        print("  CONFIG_PATH='%s' ./kiro-go" % os.path.abspath(args.config.strip()))
-    else:
-        print("Next: add this account to your Kiro-Go data/config.json. Either")
-        print("  - paste the object into the config.json \"accounts\": [ ... ] array, or")
-        print("  - re-run with --config /path/to/Kiro-Go/data/config.json to merge it automatically.")
-    if account["authMethod"] == "external_idp":
-        print()
-        print("Note: external_idp (Microsoft 365 / Entra ID) refresh needs Kiro-Go PR #131")
-        print("      (tokenEndpoint/issuerUrl/scopes + the external_idp refresh branch).")
-    return 0
+    account = build_kiro_go_account(token, region, email, args.provider.strip())
+    return persist_and_report(args, helper, account, email, region, token["profile_arn"])
 
 
 if __name__ == "__main__":
