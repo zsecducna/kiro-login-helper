@@ -2,6 +2,7 @@
 CLIProxyAPI_*.json
 kiro-*.json
 *.auth.json
+api-keys/
 
 # Python
 __pycache__/
